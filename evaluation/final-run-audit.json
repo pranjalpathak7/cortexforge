@@ -1,0 +1,78 @@
+[
+  {
+    "id": "b96e2d89ad3c414c8ff8d4bdeff3739d",
+    "mode": "demo",
+    "fault": "none",
+    "state": "APPROVED",
+    "reviewer": "reviewer-1",
+    "error": null,
+    "approved_patch_export_status": 200,
+    "patch_contains_feature": true
+  },
+  {
+    "id": "284fc2b314b3415f898d6668d16421c6",
+    "mode": "demo",
+    "fault": "test",
+    "state": "REJECTED",
+    "reviewer": "reviewer-1",
+    "error": null
+  },
+  {
+    "id": "f9262bbe111343bdb0b7eb5ddda621f3",
+    "mode": "demo",
+    "fault": "security",
+    "state": "FAILED",
+    "reviewer": null,
+    "error": "Security gate failed; human correction required, approval prohibited"
+  },
+  {
+    "id": "e6418e7e360b44809188f06782ca0749",
+    "mode": "demo",
+    "fault": "scope",
+    "state": "FAILED",
+    "reviewer": null,
+    "error": "New files must be explicitly scoped tests/test_*.py"
+  },
+  {
+    "id": "48295b49d668450b8fe2ab78ae2f0c25",
+    "mode": "demo",
+    "fault": "repeat",
+    "state": "FAILED",
+    "reviewer": null,
+    "error": "Repeated action detected; stopped before reapplying"
+  },
+  {
+    "id": "519c233810514fcbba7d04c4728b44b0",
+    "mode": "demo",
+    "fault": "malformed",
+    "state": "FAILED",
+    "reviewer": null,
+    "error": "Malformed structured output after two attempts"
+  },
+  {
+    "id": "88e5d0cedb394fb99e3df8270a98d959",
+    "mode": "demo",
+    "fault": "provider",
+    "state": "BLOCKED",
+    "reviewer": null,
+    "error": "Controlled provider outage"
+  },
+  {
+    "id": "75537cbb93f2440a9a8d893c6f19e128",
+    "mode": "demo",
+    "fault": "disagree",
+    "state": "FAILED",
+    "reviewer": null,
+    "error": "Architect\u2013Developer disagreement exhausted; human escalation required"
+  },
+  {
+    "id": "bd448f3481f4431e9a78a99c352b215c",
+    "mode": "live",
+    "fault": "none",
+    "state": "APPROVED",
+    "reviewer": "reviewer-1",
+    "error": null,
+    "approved_patch_export_status": 200,
+    "patch_contains_feature": true
+  }
+]

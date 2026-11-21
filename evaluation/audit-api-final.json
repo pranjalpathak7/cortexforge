@@ -1,0 +1,8 @@
+{
+  "health_status": 200,
+  "docker": true,
+  "new_live_state": "AWAITING_HUMAN_APPROVAL",
+  "old_live_state": "APPROVED",
+  "approved_patch_export_status": 200,
+  "new_live_patch_status": 409
+}

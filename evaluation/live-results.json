@@ -1,0 +1,227 @@
+{
+  "mode": "live Groq; real Docker checks",
+  "run_id": "bd448f3481f4431e9a78a99c352b215c",
+  "state": "AWAITING_HUMAN_APPROVAL",
+  "passed": true,
+  "error": null,
+  "rubric": {
+    "baseline_passed": 3,
+    "candidate_passed": 4,
+    "repair_attempts": 0,
+    "scoped_change": true,
+    "unexpected_files_modified": 0,
+    "tests": {
+      "passed": 8,
+      "failed": 0,
+      "error": 0,
+      "skipped": 0
+    },
+    "trusted_acceptance_tests": {
+      "passed": 12,
+      "failed": 0,
+      "error": 0,
+      "skipped": 0
+    },
+    "acceptance": "Test-backed proxy; human must confirm semantic completeness"
+  },
+  "model_usage": [
+    {
+      "agent": "analyst",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 668,
+      "output_tokens": 271,
+      "thinking_tokens": 52,
+      "total_tokens": 939,
+      "latency_ms": 1766,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-remaining-tokens": "6603",
+        "x-ratelimit-reset-requests": "1m26.4s",
+        "x-ratelimit-reset-tokens": "10.477s"
+      }
+    },
+    {
+      "agent": "architect",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 841,
+      "output_tokens": 236,
+      "thinking_tokens": 30,
+      "total_tokens": 1077,
+      "latency_ms": 1594,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "998",
+        "x-ratelimit-remaining-tokens": "5136",
+        "x-ratelimit-reset-requests": "2m52.8s",
+        "x-ratelimit-reset-tokens": "21.48s"
+      }
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 1047,
+      "output_tokens": 565,
+      "thinking_tokens": 21,
+      "total_tokens": 1612,
+      "latency_ms": 2218,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "997",
+        "x-ratelimit-remaining-tokens": "5255",
+        "x-ratelimit-reset-requests": "4m19.2s",
+        "x-ratelimit-reset-tokens": "20.587s"
+      }
+    }
+  ],
+  "independent_acceptance": {
+    "operation": "acceptance",
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider",
+      "_cortexforge_acceptance.py"
+    ],
+    "exit_code": 0,
+    "output": "............                                                             [100%]\n12 passed in 0.08s\n",
+    "truncated": false,
+    "duration_ms": 1266,
+    "timeout": false,
+    "executor": "docker",
+    "image": "cortexforge-sandbox:local",
+    "test_counts": {
+      "passed": 12,
+      "failed": 0,
+      "error": 0,
+      "skipped": 0
+    },
+    "tree_hash": "3711167c46bb11a3b792639f1cbb47cc62618b49f57db9fa8c3f976990d51738",
+    "phase": "candidate",
+    "iteration": 0
+  },
+  "checks": [
+    {
+      "operation": "unit",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "output": "........                                                                 [100%]\n8 passed in 0.11s\n",
+      "truncated": false,
+      "duration_ms": 1297,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 8,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "3711167c46bb11a3b792639f1cbb47cc62618b49f57db9fa8c3f976990d51738",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "lint",
+      "command": [
+        "ruff",
+        "check",
+        "--no-cache",
+        "."
+      ],
+      "exit_code": 0,
+      "output": "All checks passed!\n",
+      "truncated": false,
+      "duration_ms": 796,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "tree_hash": "3711167c46bb11a3b792639f1cbb47cc62618b49f57db9fa8c3f976990d51738",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "acceptance",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "_cortexforge_acceptance.py"
+      ],
+      "exit_code": 0,
+      "output": "............                                                             [100%]\n12 passed in 0.08s\n",
+      "truncated": false,
+      "duration_ms": 1266,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 12,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "3711167c46bb11a3b792639f1cbb47cc62618b49f57db9fa8c3f976990d51738",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "security",
+      "command": [
+        "bandit",
+        "--ignore-nosec",
+        "-r",
+        ".",
+        "-x",
+        "./tests",
+        "-f",
+        "json"
+      ],
+      "exit_code": 0,
+      "output": "[main]\tINFO\tprofile include tests: None\n[main]\tINFO\tprofile exclude tests: None\n[main]\tINFO\tcli include tests: None\n[main]\tINFO\tcli exclude tests: None\n{\n  \"errors\": [],\n  \"generated_at\": \"2026-11-20T22:40:18Z\",\n  \"metrics\": {\n    \"./payments.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 20,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"_totals\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 20,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    }\n  },\n  \"results\": []\n}",
+      "truncated": false,
+      "duration_ms": 1016,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "findings": [],
+      "tree_hash": "3711167c46bb11a3b792639f1cbb47cc62618b49f57db9fa8c3f976990d51738",
+      "phase": "candidate",
+      "iteration": 0
+    }
+  ],
+  "human_decision": "Not supplied; evaluation never approves itself"
+}

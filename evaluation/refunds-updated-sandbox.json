@@ -1,0 +1,102 @@
+{
+  "run_id": "aaf4eb55a7dc400ca16873196177c72d",
+  "tree_hash": "abeb15190fb992b92499080d9af179b9e0b849b21aae2af5c9241a5d69db9ac1",
+  "purpose": "Independent revalidation against updated sandbox; does not alter prior approval evidence",
+  "checks": [
+    {
+      "operation": "unit",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "output": "...............                                                          [100%]\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1\n  /usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\napi.py:15\n  /workspace/api.py:15: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    class RefundRequest(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n15 passed, 2 warnings in 1.08s\n",
+      "truncated": false,
+      "duration_ms": 2437,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:audit",
+      "image_id": "sha256:09227f8edbb57e5da4519368d6d26f4ba8c9fe814967bd0409d3649044ea7b41",
+      "oracle_hash": null,
+      "test_counts": {
+        "passed": 15,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "operation": "lint",
+      "command": [
+        "ruff",
+        "check",
+        "--no-cache",
+        "."
+      ],
+      "exit_code": 0,
+      "output": "All checks passed!\n",
+      "truncated": false,
+      "duration_ms": 750,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:audit",
+      "image_id": "sha256:09227f8edbb57e5da4519368d6d26f4ba8c9fe814967bd0409d3649044ea7b41",
+      "oracle_hash": null
+    },
+    {
+      "operation": "acceptance",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "_cortexforge_acceptance.py"
+      ],
+      "exit_code": 0,
+      "output": "....................                                                     [100%]\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1\n  /usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\napi.py:15\n  /workspace/api.py:15: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    class RefundRequest(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n20 passed, 2 warnings in 1.25s\n",
+      "truncated": false,
+      "duration_ms": 2672,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:audit",
+      "image_id": "sha256:09227f8edbb57e5da4519368d6d26f4ba8c9fe814967bd0409d3649044ea7b41",
+      "oracle_hash": "b74afde882c90113ed043d1a18d6c309cdaa5d165389e482cfedb685170dbd06",
+      "test_counts": {
+        "passed": 20,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "operation": "security",
+      "command": [
+        "bandit",
+        "--ignore-nosec",
+        "-r",
+        ".",
+        "-x",
+        "./tests",
+        "-f",
+        "json"
+      ],
+      "exit_code": 0,
+      "output": "[main]\tINFO\tprofile include tests: None\n[main]\tINFO\tprofile exclude tests: None\n[main]\tINFO\tcli include tests: None\n[main]\tINFO\tcli exclude tests: None\n{\n  \"errors\": [],\n  \"generated_at\": \"2026-11-21T06:58:42Z\",\n  \"metrics\": {\n    \"./api.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 44,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./health.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 3,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./ledger.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 11,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./service.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 61,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"_totals\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 119,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    }\n  },\n  \"results\": []\n}",
+      "truncated": false,
+      "duration_ms": 1125,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:audit",
+      "image_id": "sha256:09227f8edbb57e5da4519368d6d26f4ba8c9fe814967bd0409d3649044ea7b41",
+      "oracle_hash": null,
+      "findings": []
+    }
+  ],
+  "passed": true
+}

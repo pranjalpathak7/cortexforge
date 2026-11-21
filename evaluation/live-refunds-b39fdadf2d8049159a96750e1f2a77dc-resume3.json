@@ -1,0 +1,577 @@
+{
+  "mode": "live Groq; real Docker checks",
+  "run_id": "b39fdadf2d8049159a96750e1f2a77dc",
+  "state": "BLOCKED",
+  "passed": false,
+  "error": "Groq request failed (status=429; quota or rate limit; code=rate_limit_exceeded; retry_after=6)",
+  "scenario": "refunds",
+  "created": "2026-11-20T23:41:23.765569+00:00",
+  "requirement": "# Refund service baseline\n\nA small FastAPI application with transport (`api.py`), business rules\n(`service.py`), a locked in-memory ledger (`ledger.py`) and an unrelated health\ncomponent. `create_app()` creates fresh state. GET payment and missing-payment\nbehavior are covered by immutable regression tests. Refunds are not implemented.\n\nTask: add `POST /payments/{payment_id}/refunds`. JSON has exactly `amount`, a\nstrict positive integer in paise. Require `Idempotency-Key` with 1\u201364 characters\nfrom ASCII letters, digits, hyphen or underscore. Reject invalid body/header with\n422. A new refund returns 201; replay of the same key/payment/amount returns 200\nand the identical original JSON. A response has `payment_id`, `amount`,\n`refunded_total` and `status`. Keys are global within this app instance; reuse\nwith a different payment or amount returns 409 without mutation. Unknown payment\nreturns 404. Cancelled payment or refund exceeding the remaining captured amount\nreturns 409. Partial refunds set status `partially_refunded`; an exact final\nrefund sets `refunded`. Prior exact replays must still succeed after full refund.\nFailures must not consume a key. Concurrent duplicate requests must mutate once.\n\nKeep business rules in the service and HTTP validation/mapping in the API.\nPreserve GET behavior and existing tests; add new regression/negative tests.\nDo not change `health.py`. No real money, external gateway, database, authentication\nor cross-process durability is claimed for this sample. CortexForge runs it only\ninside Docker.\n",
+  "base": "2909548ea02e297240678b5b6581b900dfd54790",
+  "evidence_hash": null,
+  "tree_hash": null,
+  "diff": "diff --git a/api.py b/api.py\nindex bd687d8..4051cbc 100644\n--- a/api.py\n+++ b/api.py\n@@ -1,9 +1,26 @@\n \"\"\"Small payment API with isolated application state per factory call.\"\"\"\n \n-from fastapi import FastAPI, HTTPException\n+from fastapi import FastAPI, HTTPException, Header, Request\n+from fastapi.responses import JSONResponse\n+from pydantic import BaseModel, Field, validator\n \n from ledger import Ledger\n-from service import PaymentService\n+from service import PaymentService, IdempotencyConflict\n+\n+\n+class RefundRequest(BaseModel):\n+    amount: int = Field(..., gt=0, description=\"Refund amount in paise, must be positive integer\")\n+\n+    @validator(\"amount\")\n+    def amount_must_be_positive(cls, v):\n+        if not isinstance(v, int) or isinstance(v, bool):\n+            raise ValueError(\"amount must be an integer\")\n+        if v <= 0:\n+            raise ValueError(\"amount must be positive\")\n+        return v\n+\n+    class Config:\n+        extra = \"forbid\"\n \n \n def create_app():\n@@ -17,4 +34,33 @@ def create_app():\n         except KeyError:\n             raise HTTPException(404, \"Payment not found\") from None\n \n+    @app.post(\"/payments/{payment_id}/refunds\")\n+    async def create_refund(\n+        payment_id: str,\n+        request: Request,\n+        refund: RefundRequest,\n+        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n+    ):\n+        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n+        if not (1 <= len(idempotency_key) <= 64) or not all(\n+            c.isalnum() or c in \"-_\" for c in idempotency_key\n+        ):\n+            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n+        try:\n+            result = service.process_refund(\n+                payment_id=payment_id,\n+                amount=refund.amount,\n+                idempotency_key=idempotency_key,\n+            )\n+        except KeyError:\n+            raise HTTPException(404, \"Payment not found\") from None\n+        except ValueError as ve:\n+            # Business rule violation (e.g., over\u2011refund, cancelled)\n+            raise HTTPException(409, str(ve)) from None\n+        except IdempotencyConflict as ic:\n+            raise HTTPException(409, str(ic)) from None\n+        # service returns tuple (status_code, payload)\n+        status_code, payload = result\n+        return JSONResponse(status_code=status_code, content=payload)\n+\n     return app\ndiff --git a/ledger.py b/ledger.py\nindex 104bb0b..bd680b8 100644\n--- a/ledger.py\n+++ b/ledger.py\n@@ -11,4 +11,5 @@ class Ledger:\n             \"p2\": {\"id\": \"p2\", \"amount\": 500, \"refunded\": 0, \"status\": \"captured\"},\n             \"p3\": {\"id\": \"p3\", \"amount\": 700, \"refunded\": 0, \"status\": \"cancelled\"},\n         }\n+        # refunds mapping: (payment_id, idempotency_key) -> refund record\n         self.refunds = {}\ndiff --git a/service.py b/service.py\nindex a36f56b..d7528d1 100644\n--- a/service.py\n+++ b/service.py\n@@ -1,14 +1,71 @@\n \"\"\"Business logic; transport concerns belong in api.py.\"\"\"\n \n from ledger import Ledger\n+from threading import RLock\n+from typing import Tuple, Dict\n+\n+\n+class IdempotencyConflict(Exception):\n+    pass\n \n \n class PaymentService:\n     def __init__(self, ledger: Ledger):\n         self.ledger = ledger\n+        # idempotency_key -> (status_code, payload)\n+        self.idempotency_store: Dict[str, Tuple[int, dict]] = {}\n+        self.idempotency_lock = RLock()\n \n     def get_payment(self, payment_id: str) -> dict:\n         with self.ledger.lock:\n             if payment_id not in self.ledger.payments:\n                 raise KeyError(payment_id)\n             return dict(self.ledger.payments[payment_id])\n+\n+    def _record_refund(self, payment_id: str, amount: int) -> dict:\n+        payment = self.ledger.payments[payment_id]\n+        payment[\"refunded\"] += amount\n+        # update status based on remaining amount\n+        if payment[\"refunded\"] == payment[\"amount\"]:\n+            payment[\"status\"] = \"refunded\"\n+        else:\n+            payment[\"status\"] = \"partially_refunded\"\n+        return {\n+            \"payment_id\": payment_id,\n+            \"amount\": amount,\n+            \"refunded_total\": payment[\"refunded\"],\n+            \"status\": payment[\"status\"],\n+        }\n+\n+    def process_refund(\n+        self, payment_id: str, amount: int, idempotency_key: str\n+    ) -> Tuple[int, dict]:\n+        # Entire operation guarded to be atomic for idempotency and concurrency\n+        with self.idempotency_lock:\n+            if idempotency_key in self.idempotency_store:\n+                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n+                if (\n+                    stored_payload.get(\"payment_id\") == payment_id\n+                    and stored_payload.get(\"amount\") == amount\n+                ):\n+                    # Replay should return 200 regardless of original status code\n+                    return 200, stored_payload\n+                else:\n+                    raise IdempotencyConflict(\n+                        \"Idempotency key conflict with different payment or amount\"\n+                    )\n+            # Not a replay: perform business validation and mutation\n+            with self.ledger.lock:\n+                if payment_id not in self.ledger.payments:\n+                    raise KeyError(payment_id)\n+                payment = self.ledger.payments[payment_id]\n+                if payment[\"status\"] == \"cancelled\":\n+                    raise ValueError(\"Cannot refund a cancelled payment\")\n+                remaining = payment[\"amount\"] - payment[\"refunded\"]\n+                if amount > remaining:\n+                    raise ValueError(\"Refund amount exceeds remaining captured amount\")\n+                response_payload = self._record_refund(payment_id, amount)\n+                status_code = 201\n+            # Store result for future replays\n+            self.idempotency_store[idempotency_key] = (status_code, response_payload)\n+            return status_code, response_payload\ndiff --git a/tests/test_refunds.py b/tests/test_refunds.py\nnew file mode 100644\nindex 0000000..0776713\n--- /dev/null\n+++ b/tests/test_refunds.py\n@@ -0,0 +1,130 @@\n+import pytest\n+from fastapi.testclient import TestClient\n+from api import create_app\n+\n+client = TestClient(create_app())\n+\n+def test_successful_refund():\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 300},\n+        headers={\"Idempotency-Key\": \"key-1\"},\n+    )\n+    assert resp.status_code == 201\n+    data = resp.json()\n+    assert data == {\n+        \"payment_id\": \"p1\",\n+        \"amount\": 300,\n+        \"refunded_total\": 300,\n+        \"status\": \"partially_refunded\",\n+    }\n+\n+def test_idempotent_replay_same_key():\n+    # first request\n+    resp1 = client.post(\n+        \"/payments/p2/refunds\",\n+        json={\"amount\": 200},\n+        headers={\"Idempotency-Key\": \"replay-key\"},\n+    )\n+    assert resp1.status_code == 201\n+    # replay\n+    resp2 = client.post(\n+        \"/payments/p2/refunds\",\n+        json={\"amount\": 200},\n+        headers={\"Idempotency-Key\": \"replay-key\"},\n+    )\n+    assert resp2.status_code == 200\n+    assert resp2.json() == resp1.json()\n+\n+def test_idempotency_conflict_different_amount():\n+    client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 100},\n+        headers={\"Idempotency-Key\": \"conflict-key\"},\n+    )\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 150},\n+        headers={\"Idempotency-Key\": \"conflict-key\"},\n+    )\n+    assert resp.status_code == 409\n+\n+def test_idempotency_conflict_different_payment():\n+    client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 50},\n+        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n+    )\n+    resp = client.post(\n+        \"/payments/p2/refunds\",\n+        json={\"amount\": 50},\n+        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n+    )\n+    assert resp.status_code == 409\n+\n+def test_invalid_body():\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": -10},\n+        headers={\"Idempotency-Key\": \"bad-body\"},\n+    )\n+    assert resp.status_code == 422\n+\n+def test_missing_idempotency_key():\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 100},\n+    )\n+    assert resp.status_code == 422\n+\n+def test_invalid_idempotency_key_format():\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 100},\n+        headers={\"Idempotency-Key\": \"\"},\n+    )\n+    assert resp.status_code == 422\n+\n+def test_unknown_payment():\n+    resp = client.post(\n+        \"/payments/unknown/refunds\",\n+        json={\"amount\": 100},\n+        headers={\"Idempotency-Key\": \"unknown-pay\"},\n+    )\n+    assert resp.status_code == 404\n+\n+def test_refund_cancelled_payment():\n+    resp = client.post(\n+        \"/payments/p3/refunds\",\n+        json={\"amount\": 100},\n+        headers={\"Idempotency-Key\": \"cancelled\"},\n+    )\n+    assert resp.status_code == 409\n+\n+def test_over_refund():\n+    # p2 amount is 500, already refunded 200 in earlier test\n+    resp = client.post(\n+        \"/payments/p2/refunds\",\n+        json={\"amount\": 400},\n+        headers={\"Idempotency-Key\": \"over-refund\"},\n+    )\n+    assert resp.status_code == 409\n+\n+def test_full_refund_and_subsequent_idempotent_replay():\n+    # p1 has 1000 total, 300 already refunded\n+    resp = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 700},\n+        headers={\"Idempotency-Key\": \"full-refund\"},\n+    )\n+    assert resp.status_code == 201\n+    data = resp.json()\n+    assert data[\"status\"] == \"refunded\"\n+    assert data[\"refunded_total\"] == 1000\n+    replay = client.post(\n+        \"/payments/p1/refunds\",\n+        json={\"amount\": 700},\n+        headers={\"Idempotency-Key\": \"full-refund\"},\n+    )\n+    assert replay.status_code == 200\n+    assert replay.json() == data\n",
+  "baseline": [
+    {
+      "operation": "unit",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "output": "...                                                                      [100%]\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n3 passed, 1 warning in 0.68s\n",
+      "truncated": false,
+      "duration_ms": 1844,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 3,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "2dc391f4ba29266897012a2cc7b7892eb1b9f3abb85e414f6989a5156320329f",
+      "phase": "baseline",
+      "iteration": 0
+    },
+    {
+      "operation": "lint",
+      "command": [
+        "ruff",
+        "check",
+        "--no-cache",
+        "."
+      ],
+      "exit_code": 0,
+      "output": "All checks passed!\n",
+      "truncated": false,
+      "duration_ms": 719,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "tree_hash": "2dc391f4ba29266897012a2cc7b7892eb1b9f3abb85e414f6989a5156320329f",
+      "phase": "baseline",
+      "iteration": 0
+    },
+    {
+      "operation": "security",
+      "command": [
+        "bandit",
+        "--ignore-nosec",
+        "-r",
+        ".",
+        "-x",
+        "./tests",
+        "-f",
+        "json"
+      ],
+      "exit_code": 0,
+      "output": "[main]\tINFO\tprofile include tests: None\n[main]\tINFO\tprofile exclude tests: None\n[main]\tINFO\tcli include tests: None\n[main]\tINFO\tcli exclude tests: None\n{\n  \"errors\": [],\n  \"generated_at\": \"2026-11-20T23:41:32Z\",\n  \"metrics\": {\n    \"./api.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 14,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./health.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 3,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./ledger.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 11,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"./service.py\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 10,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    },\n    \"_totals\": {\n      \"CONFIDENCE.HIGH\": 0,\n      \"CONFIDENCE.LOW\": 0,\n      \"CONFIDENCE.MEDIUM\": 0,\n      \"CONFIDENCE.UNDEFINED\": 0,\n      \"SEVERITY.HIGH\": 0,\n      \"SEVERITY.LOW\": 0,\n      \"SEVERITY.MEDIUM\": 0,\n      \"SEVERITY.UNDEFINED\": 0,\n      \"loc\": 38,\n      \"nosec\": 0,\n      \"skipped_tests\": 0\n    }\n  },\n  \"results\": []\n}",
+      "truncated": false,
+      "duration_ms": 984,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "findings": [],
+      "tree_hash": "2dc391f4ba29266897012a2cc7b7892eb1b9f3abb85e414f6989a5156320329f",
+      "phase": "baseline",
+      "iteration": 0
+    },
+    {
+      "operation": "acceptance",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "_cortexforge_acceptance.py"
+      ],
+      "exit_code": 1,
+      "output": "FFFFFFFFFFFFFFFFFF                                                       [100%]\n=================================== FAILURES ===================================\n__________________________ test_partial_and_complete ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223e97860>\n\n    def test_partial_and_complete(client):\n        first = refund(client)\n>       assert first.status_code == 201\nE       assert 404 == 201\nE        +  where 404 = <Response [404 Not Found]>.status_code\n\n_cortexforge_acceptance.py:17: AssertionError\n_______ test_replay_preserves_original_response_even_after_final_refund ________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223d37d70>\n\n    def test_replay_preserves_original_response_even_after_final_refund(client):\n        first = refund(client)\n>       assert first.status_code == 201\nE       assert 404 == 201\nE        +  where 404 = <Response [404 Not Found]>.status_code\n\n_cortexforge_acceptance.py:29: AssertionError\n_______________________ test_conflicting_replay[301-p1] ________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223d7af30>\namount = 301, payment = 'p1'\n\n    @pytest.mark.parametrize(\"amount,payment\", [(301, \"p1\"), (300, \"p2\")])\n    def test_conflicting_replay(client, amount, payment):\n>       assert refund(client).status_code == 201\nE       assert 404 == 201\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e1223d7af30>)\n\n_cortexforge_acceptance.py:37: AssertionError\n_______________________ test_conflicting_replay[300-p2] ________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223d79b50>\namount = 300, payment = 'p2'\n\n    @pytest.mark.parametrize(\"amount,payment\", [(301, \"p1\"), (300, \"p2\")])\n    def test_conflicting_replay(client, amount, payment):\n>       assert refund(client).status_code == 201\nE       assert 404 == 201\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e1223d79b50>)\n\n_cortexforge_acceptance.py:37: AssertionError\n____________________________ test_invalid_amount[0] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223daf3b0>, amount = 0\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e1223daf3b0>, 0)\n\n_cortexforge_acceptance.py:44: AssertionError\n___________________________ test_invalid_amount[-1] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e12233d16d0>, amount = -1\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e12233d16d0>, -1)\n\n_cortexforge_acceptance.py:44: AssertionError\n___________________________ test_invalid_amount[1.5] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e12233d3ce0>\namount = 1.5\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e12233d3ce0>, 1.5)\n\n_cortexforge_acceptance.py:44: AssertionError\n___________________________ test_invalid_amount[10] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e12233d16d0>\namount = '10'\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       AssertionError: assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e12233d16d0>, '10')\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_amount[True] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e12233d0500>\namount = True\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e12233d0500>, True)\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_amount[None] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223daed20>\namount = None\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e1223daed20>, None)\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_key[headers0] __________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223dadb80>\nheaders = {}\n\n    @pytest.mark.parametrize(\"headers\", [{}, {\"Idempotency-Key\": \"\"},\n        {\"Idempotency-Key\": \"x\" * 65}, {\"Idempotency-Key\": \"bad key\"}])\n    def test_invalid_key(client, headers):\n>       assert client.post(\"/payments/p1/refunds\", json={\"amount\": 1}, headers=headers).status_code == 422\nE       AssertionError: assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = post('/payments/p1/refunds', json={'amount': 1}, headers={})\nE        +      where post = <starlette.testclient.TestClient object at 0x7e1223dadb80>.post\n\n_cortexforge_acceptance.py:50: AssertionError\n__________________________ test_invalid_key[headers1] __________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223d78d40>\nheaders = {'Idempotency-Key': ''}\n\n    @pytest.mark.parametrize(\"headers\", [{}, {\"Idempotency-Key\": \"\"},\n        {\"Idempotency-Key\": \"x\" * 65}, {\"Idempotency-Key\": \"bad key\"}])\n    def test_invalid_key(client, headers):\n>       assert client.post(\"/payments/p1/refunds\", json={\"amount\": 1}, headers=headers).status_code == 422\nE       AssertionError: assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = post('/payments/p1/refunds', json={'amount': 1}, headers={'Idempotency-Key': ''})\nE        +      where post = <starlette.testclient.TestClient object at 0x7e1223d78d40>.post\n\n_cortexforge_acceptance.py:50: AssertionError\n__________________________ test_invalid_key[headers2] __________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223e97590>\nheaders = {'Idempotency-Key': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'}\n\n    @pytest.mark.parametrize(\"headers\", [{}, {\"Idempotency-Key\": \"\"},\n        {\"Idempotency-Key\": \"x\" * 65}, {\"Idempotency-Key\": \"bad key\"}])\n    def test_invalid_key(client, headers):\n>       assert client.post(\"/payments/p1/refunds\", json={\"amount\": 1}, headers=headers).status_code == 422\nE       AssertionError: assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = post('/payments/p1/refunds', json={'amount': 1}, headers={'Idempotency-Key': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})\nE        +      where post = <starlette.testclient.TestClient object at 0x7e1223e97590>.post\n\n_cortexforge_acceptance.py:50: AssertionError\n__________________________ test_invalid_key[headers3] __________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e12233eb710>\nheaders = {'Idempotency-Key': 'bad key'}\n\n    @pytest.mark.parametrize(\"headers\", [{}, {\"Idempotency-Key\": \"\"},\n        {\"Idempotency-Key\": \"x\" * 65}, {\"Idempotency-Key\": \"bad key\"}])\n    def test_invalid_key(client, headers):\n>       assert client.post(\"/payments/p1/refunds\", json={\"amount\": 1}, headers=headers).status_code == 422\nE       AssertionError: assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = post('/payments/p1/refunds', json={'amount': 1}, headers={'Idempotency-Key': 'bad key'})\nE        +      where post = <starlette.testclient.TestClient object at 0x7e12233eb710>.post\n\n_cortexforge_acceptance.py:50: AssertionError\n_____________________________ test_unknown_payment _____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e122341bd10>\n\n    def test_unknown_payment(client):\n        assert refund(client, payment=\"missing\").status_code == 404\n>       assert refund(client).status_code == 201\nE       assert 404 == 201\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e122341bd10>)\n\n_cortexforge_acceptance.py:54: AssertionError\n_________ test_invalid_business_state_and_failure_does_not_consume_key _________\n\nclient = <starlette.testclient.TestClient object at 0x7e122341ab10>\n\n    def test_invalid_business_state_and_failure_does_not_consume_key(client):\n>       assert refund(client, payment=\"p3\").status_code == 409\nE       AssertionError: assert 404 == 409\nE        +  where 404 = <Response [404 Not Found]>.status_code\nE        +    where <Response [404 Not Found]> = refund(<starlette.testclient.TestClient object at 0x7e122341ab10>, payment='p3')\n\n_cortexforge_acceptance.py:57: AssertionError\n__________________________ test_extra_fields_rejected __________________________\n\nclient = <starlette.testclient.TestClient object at 0x7e1223429d90>\n\n    def test_extra_fields_rejected(client):\n        result = client.post(\"/payments/p1/refunds\", json={\"amount\": 1, \"admin\": True},\n                             headers={\"Idempotency-Key\": \"extra\"})\n>       assert result.status_code == 422\nE       assert 404 == 422\nE        +  where 404 = <Response [404 Not Found]>.status_code\n\n_cortexforge_acceptance.py:66: AssertionError\n__________________ test_concurrent_duplicate_is_applied_once ___________________\n\nclient = <starlette.testclient.TestClient object at 0x7e122342b1a0>\n\n    def test_concurrent_duplicate_is_applied_once(client):\n        with ThreadPoolExecutor(max_workers=4) as pool:\n            responses = list(pool.map(lambda _: refund(client), range(4)))\n>       assert sorted(r.status_code for r in responses) == [200, 200, 200, 201]\nE       assert [404, 404, 404, 404] == [200, 200, 200, 201]\nE         \nE         At index 0 diff: 404 != 200\nE         Use -v to get more diff\n\n_cortexforge_acceptance.py:71: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED _cortexforge_acceptance.py::test_partial_and_complete - assert 404 == 201\nFAILED _cortexforge_acceptance.py::test_replay_preserves_original_response_even_after_final_refund\nFAILED _cortexforge_acceptance.py::test_conflicting_replay[301-p1] - assert 4...\nFAILED _cortexforge_acceptance.py::test_conflicting_replay[300-p2] - assert 4...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[0] - assert 404 == 422\nFAILED _cortexforge_acceptance.py::test_invalid_amount[-1] - assert 404 == 422\nFAILED _cortexforge_acceptance.py::test_invalid_amount[1.5] - assert 404 == 422\nFAILED _cortexforge_acceptance.py::test_invalid_amount[10] - AssertionError: ...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[True] - assert 404 == 422\nFAILED _cortexforge_acceptance.py::test_invalid_amount[None] - assert 404 == 422\nFAILED _cortexforge_acceptance.py::test_invalid_key[headers0] - AssertionErro...\nFAILED _cortexforge_acceptance.py::test_invalid_key[headers1] - AssertionErro...\nFAILED _cortexforge_acceptance.py::test_invalid_key[headers2] - AssertionErro...\nFAILED _cortexforge_acceptance.py::test_invalid_key[headers3] - AssertionErro...\nFAILED _cortexforge_acceptance.py::test_unknown_payment - assert 404 == 201\nFAILED _cortexforge_acceptance.py::test_invalid_business_state_and_failure_does_not_consume_key\nFAILED _cortexforge_acceptance.py::test_extra_fields_rejected - assert 404 ==...\nFAILED _cortexforge_acceptance.py::test_concurrent_duplicate_is_applied_once\n18 failed, 1 warning in 1.07s\n",
+      "truncated": false,
+      "duration_ms": 2235,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 0,
+        "failed": 18,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "2dc391f4ba29266897012a2cc7b7892eb1b9f3abb85e414f6989a5156320329f",
+      "phase": "baseline",
+      "iteration": 0
+    }
+  ],
+  "repairs": 2,
+  "attempted_changes": 2,
+  "changed_files": [
+    "api.py",
+    "ledger.py",
+    "service.py",
+    "tests/test_refunds.py"
+  ],
+  "agent_outputs": [
+    {
+      "agent": "analyst",
+      "output": {
+        "acceptance": [
+          "All existing tests must continue to pass.",
+          "New endpoint POST /payments/{payment_id}/refunds must be implemented according to the specification.",
+          "Proper validation of request body and Idempotency-Key header must return 422 on failure.",
+          "Idempotent behavior must return 200 with original response for replayed requests.",
+          "Conflicting idempotency key usage must return 409 without mutating state.",
+          "Refund logic must enforce payment existence, status, and remaining amount, returning appropriate status codes (404, 409).",
+          "Response JSON must contain payment_id, amount, refunded_total, and status with correct values.",
+          "Concurrent duplicate requests must result in a single mutation.",
+          "New regression and negative tests must be added under tests/test_*.py and must all pass."
+        ],
+        "tasks": [
+          "Add refund request model and validation in api.py, including Idempotency-Key header constraints.",
+          "Create POST route handler in api.py that delegates to PaymentService.",
+          "Extend PaymentService in service.py with methods to process refunds, track idempotency keys, and enforce business rules.",
+          "Update Ledger class in ledger.py to store refunds and support thread\u2011safe operations.",
+          "Implement idempotency key storage with global scope per app instance and ensure proper conflict handling.",
+          "Add new test modules (e.g., tests/test_refunds.py) covering successful refunds, idempotent replays, conflict scenarios, validation errors, unknown payments, cancelled payments, and over\u2011refund attempts.",
+          "Run existing tests to confirm no regression."
+        ],
+        "questions": [],
+        "constraints": [
+          "Do not modify health.py.",
+          "Keep business rules inside service.py; HTTP validation stays in api.py.",
+          "Do not alter existing tests (tests/test_existing.py).",
+          "Only add or modify files within the repository as per allowed changes.",
+          "Use only the provided repository context; do not assume external packages beyond FastAPI and standard library."
+        ]
+      }
+    },
+    {
+      "agent": "architect",
+      "output": {
+        "files": [
+          "api.py",
+          "service.py",
+          "ledger.py",
+          "tests/test_refunds.py"
+        ],
+        "rationale": "Implemented the required POST /payments/{payment_id}/refunds endpoint with strict request body validation and Idempotency-Key header checks in api.py. Added business logic for processing refunds, tracking idempotency keys, and enforcing payment state and amount constraints in service.py. Extended Ledger to store refund records and ensure thread\u2011safe operations. Created comprehensive tests covering successful refunds, idempotent replays, key conflicts, validation errors, unknown or cancelled payments, and over\u2011refund attempts, ensuring the new functionality meets the specification while preserving existing behavior.",
+        "risks": [
+          "Thread\u2011safety: concurrent duplicate requests rely on the Ledger lock; misuse could lead to race conditions.",
+          "Idempotency key storage is kept in the service instance; if the app factory is called multiple times in tests, keys are isolated per app as required.",
+          "Response schema must exactly match specification; any deviation may cause test failures."
+        ],
+        "validation": [
+          "Run existing tests (tests/test_existing.py) to confirm no regression.",
+          "Execute new tests (tests/test_refunds.py) to verify all refund scenarios and idempotency behavior.",
+          "Manual inspection of API docs (FastAPI) to ensure request model and header constraints are correctly declared."
+        ]
+      }
+    },
+    {
+      "agent": "developer",
+      "output": {
+        "agrees_with_design": true,
+        "disagreement": "",
+        "changes": [
+          {
+            "path": "api.py",
+            "content": "\"\"\"Small payment API with isolated application state per factory call.\"\"\"\n\nfrom fastapi import FastAPI, HTTPException, Header, Request\nfrom fastapi.responses import JSONResponse\nfrom pydantic import BaseModel, Field, validator\n\nfrom ledger import Ledger\nfrom service import PaymentService\n\n\nclass RefundRequest(BaseModel):\n    amount: int = Field(..., gt=0, description=\"Refund amount in paise, must be positive integer\")\n\n    @validator(\"amount\")\n    def amount_must_be_positive(cls, v):\n        if v <= 0:\n            raise ValueError(\"amount must be positive\")\n        return v\n\n\ndef create_app():\n    app = FastAPI()\n    service = PaymentService(Ledger())\n\n    @app.get(\"/payments/{payment_id}\")\n    def get_payment(payment_id: str):\n        try:\n            return service.get_payment(payment_id)\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n        except service.IdempotencyConflict as ic:\n            raise HTTPException(409, str(ic)) from None\n        # service returns tuple (status_code, payload)\n        status_code, payload = result\n        return JSONResponse(status_code=status_code, content=payload)\n\n    return app\n"
+          },
+          {
+            "path": "service.py",
+            "content": "\"\"\"Business logic; transport concerns belong in api.py.\"\"\"\n\nfrom ledger import Ledger\nfrom threading import RLock\nfrom typing import Tuple, Dict\n\n\nclass IdempotencyConflict(Exception):\n    pass\n\n\nclass PaymentService:\n    def __init__(self, ledger: Ledger):\n        self.ledger = ledger\n        # idempotency_key -> response payload (dict) and status_code\n        self.idempotency_store: Dict[str, Tuple[int, dict]] = {}\n        self.idempotency_lock = RLock()\n\n    def get_payment(self, payment_id: str) -> dict:\n        with self.ledger.lock:\n            if payment_id not in self.ledger.payments:\n                raise KeyError(payment_id)\n            return dict(self.ledger.payments[payment_id])\n\n    def _record_refund(self, payment_id: str, amount: int) -> dict:\n        payment = self.ledger.payments[payment_id]\n        payment[\"refunded\"] += amount\n        # update status based on remaining amount\n        if payment[\"refunded\"] == payment[\"amount\"]:\n            payment[\"status\"] = \"refunded\"\n        else:\n            payment[\"status\"] = \"partially_refunded\"\n        return {\n            \"payment_id\": payment_id,\n            \"amount\": amount,\n            \"refunded_total\": payment[\"refunded\"],\n            \"status\": payment[\"status\"],\n        }\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Idempotency handling \u2013 ensure atomic check\u2011and\u2011set\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                # Verify that stored key matches same payment and amount\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    return stored_status, stored_payload\n                else:\n                    raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\n        # Not a replay \u2013 perform business validation and mutation under ledger lock\n        with self.ledger.lock:\n            if payment_id not in self.ledger.payments:\n                raise KeyError(payment_id)\n            payment = self.ledger.payments[payment_id]\n            if payment[\"status\"] == \"cancelled\":\n                raise ValueError(\"Cannot refund a cancelled payment\")\n            remaining = payment[\"amount\"] - payment[\"refunded\"]\n            if amount > remaining:\n                raise ValueError(\"Refund amount exceeds remaining captured amount\")\n            # Apply refund\n            response_payload = self._record_refund(payment_id, amount)\n            status_code = 201\n        # Store idempotency result after successful mutation\n        with self.idempotency_lock:\n            self.idempotency_store[idempotency_key] = (status_code, response_payload)\n        return status_code, response_payload\n"
+          },
+          {
+            "path": "ledger.py",
+            "content": "\"\"\"In-memory ledger for a controlled local exercise, not a payment gateway.\"\"\"\n\nfrom threading import RLock\n\n\nclass Ledger:\n    def __init__(self):\n        self.lock = RLock()\n        self.payments = {\n            \"p1\": {\"id\": \"p1\", \"amount\": 1000, \"refunded\": 0, \"status\": \"captured\"},\n            \"p2\": {\"id\": \"p2\", \"amount\": 500, \"refunded\": 0, \"status\": \"captured\"},\n            \"p3\": {\"id\": \"p3\", \"amount\": 700, \"refunded\": 0, \"status\": \"cancelled\"},\n        }\n        # refunds mapping: (payment_id, idempotency_key) -> refund record\n        self.refunds = {}\n"
+          },
+          {
+            "path": "tests/test_refunds.py",
+            "content": "import pytest\nfrom fastapi.testclient import TestClient\nfrom api import create_app\n\nclient = TestClient(create_app())\n\ndef test_successful_refund():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 300},\n        headers={\"Idempotency-Key\": \"key-1\"},\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data == {\n        \"payment_id\": \"p1\",\n        \"amount\": 300,\n        \"refunded_total\": 300,\n        \"status\": \"partially_refunded\",\n    }\n\ndef test_idempotent_replay_same_key():\n    # first request\n    resp1 = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 200},\n        headers={\"Idempotency-Key\": \"replay-key\"},\n    )\n    assert resp1.status_code == 201\n    # replay\n    resp2 = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 200},\n        headers={\"Idempotency-Key\": \"replay-key\"},\n    )\n    assert resp2.status_code == 200\n    assert resp2.json() == resp1.json()\n\ndef test_idempotency_conflict_different_amount():\n    # initial use\n    client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"conflict-key\"},\n    )\n    # conflict with different amount\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 150},\n        headers={\"Idempotency-Key\": \"conflict-key\"},\n    )\n    assert resp.status_code == 409\n\ndef test_idempotency_conflict_different_payment():\n    client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 50},\n        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n    )\n    resp = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 50},\n        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n    )\n    assert resp.status_code == 409\n\ndef test_invalid_body():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": -10},\n        headers={\"Idempotency-Key\": \"bad-body\"},\n    )\n    assert resp.status_code == 422\n\ndef test_missing_idempotency_key():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n    )\n    assert resp.status_code == 422\n\ndef test_invalid_idempotency_key_format():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"\"},\n    )\n    assert resp.status_code == 422\n\ndef test_unknown_payment():\n    resp = client.post(\n        \"/payments/unknown/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"unknown-pay\"},\n    )\n    assert resp.status_code == 404\n\ndef test_refund_cancelled_payment():\n    resp = client.post(\n        \"/payments/p3/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"cancelled\"},\n    )\n    assert resp.status_code == 409\n\ndef test_over_refund():\n    # p2 amount is 500, already refunded 200 in earlier test\n    resp = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 400},\n        headers={\"Idempotency-Key\": \"over-refund\"},\n    )\n    assert resp.status_code == 409\n\ndef test_full_refund_and_subsequent_idempotent_replay():\n    # fresh payment p1 has 1000 total, 300 already refunded from test_successful_refund\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 700},\n        headers={\"Idempotency-Key\": \"full-refund\"},\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data[\"status\"] == \"refunded\"\n    assert data[\"refunded_total\"] == 1000\n    # replay same key should succeed with 200\n    replay = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 700},\n        headers={\"Idempotency-Key\": \"full-refund\"},\n    )\n    assert replay.status_code == 200\n    assert replay.json() == data\n"
+          }
+        ],
+        "summary": "Implemented POST /payments/{payment_id}/refunds with validation, idempotency handling, refund business logic, ledger storage, and comprehensive tests while preserving existing functionality."
+      }
+    },
+    {
+      "agent": "developer",
+      "output": {
+        "agrees_with_design": true,
+        "disagreement": "",
+        "changes": [
+          {
+            "path": "api.py",
+            "content": "\"\"\"Small payment API with isolated application state per factory call.\"\"\"\n\nfrom fastapi import FastAPI, HTTPException, Header, Request\nfrom fastapi.responses import JSONResponse\nfrom pydantic import BaseModel, Field, validator\n\nfrom ledger import Ledger\nfrom service import PaymentService, IdempotencyConflict\n\n\nclass RefundRequest(BaseModel):\n    amount: int = Field(..., gt=0, description=\"Refund amount in paise, must be positive integer\")\n\n    @validator(\"amount\")\n    def amount_must_be_positive(cls, v):\n        if not isinstance(v, int) or isinstance(v, bool):\n            raise ValueError(\"amount must be an integer\")\n        if v <= 0:\n            raise ValueError(\"amount must be positive\")\n        return v\n\n    class Config:\n        extra = \"forbid\"\n\n\ndef create_app():\n    app = FastAPI()\n    service = PaymentService(Ledger())\n\n    @app.get(\"/payments/{payment_id}\")\n    def get_payment(payment_id: str):\n        try:\n            return service.get_payment(payment_id)\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n        except IdempotencyConflict as ic:\n            raise HTTPException(409, str(ic)) from None\n        # service returns tuple (status_code, payload)\n        status_code, payload = result\n        return JSONResponse(status_code=status_code, content=payload)\n\n    return app\n"
+          },
+          {
+            "path": "service.py",
+            "content": "\"\"\"Business logic; transport concerns belong in api.py.\"\"\"\n\nfrom ledger import Ledger\nfrom threading import RLock\nfrom typing import Tuple, Dict\n\n\nclass IdempotencyConflict(Exception):\n    pass\n\n\nclass PaymentService:\n    def __init__(self, ledger: Ledger):\n        self.ledger = ledger\n        # idempotency_key -> (status_code, payload)\n        self.idempotency_store: Dict[str, Tuple[int, dict]] = {}\n        self.idempotency_lock = RLock()\n\n    def get_payment(self, payment_id: str) -> dict:\n        with self.ledger.lock:\n            if payment_id not in self.ledger.payments:\n                raise KeyError(payment_id)\n            return dict(self.ledger.payments[payment_id])\n\n    def _record_refund(self, payment_id: str, amount: int) -> dict:\n        payment = self.ledger.payments[payment_id]\n        payment[\"refunded\"] += amount\n        # update status based on remaining amount\n        if payment[\"refunded\"] == payment[\"amount\"]:\n            payment[\"status\"] = \"refunded\"\n        else:\n            payment[\"status\"] = \"partially_refunded\"\n        return {\n            \"payment_id\": payment_id,\n            \"amount\": amount,\n            \"refunded_total\": payment[\"refunded\"],\n            \"status\": payment[\"status\"],\n        }\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Entire operation guarded to be atomic for idempotency and concurrency\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    # Replay should return 200 regardless of original status code\n                    return 200, stored_payload\n                else:\n                    raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\n            # Not a replay: perform business validation and mutation\n            with self.ledger.lock:\n                if payment_id not in self.ledger.payments:\n                    raise KeyError(payment_id)\n                payment = self.ledger.payments[payment_id]\n                if payment[\"status\"] == \"cancelled\":\n                    raise ValueError(\"Cannot refund a cancelled payment\")\n                remaining = payment[\"amount\"] - payment[\"refunded\"]\n                if amount > remaining:\n                    raise ValueError(\"Refund amount exceeds remaining captured amount\")\n                response_payload = self._record_refund(payment_id, amount)\n                status_code = 201\n            # Store result for future replays\n            self.idempotency_store[idempotency_key] = (status_code, response_payload)\n            return status_code, response_payload\n"
+          },
+          {
+            "path": "tests/test_refunds.py",
+            "content": "import pytest\nfrom fastapi.testclient import TestClient\nfrom api import create_app\n\nclient = TestClient(create_app())\n\ndef test_successful_refund():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 300},\n        headers={\"Idempotency-Key\": \"key-1\"},\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data == {\n        \"payment_id\": \"p1\",\n        \"amount\": 300,\n        \"refunded_total\": 300,\n        \"status\": \"partially_refunded\",\n    }\n\ndef test_idempotent_replay_same_key():\n    # first request\n    resp1 = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 200},\n        headers={\"Idempotency-Key\": \"replay-key\"},\n    )\n    assert resp1.status_code == 201\n    # replay\n    resp2 = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 200},\n        headers={\"Idempotency-Key\": \"replay-key\"},\n    )\n    assert resp2.status_code == 200\n    assert resp2.json() == resp1.json()\n\ndef test_idempotency_conflict_different_amount():\n    client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"conflict-key\"},\n    )\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 150},\n        headers={\"Idempotency-Key\": \"conflict-key\"},\n    )\n    assert resp.status_code == 409\n\ndef test_idempotency_conflict_different_payment():\n    client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 50},\n        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n    )\n    resp = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 50},\n        headers={\"Idempotency-Key\": \"diff-pay-key\"},\n    )\n    assert resp.status_code == 409\n\ndef test_invalid_body():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": -10},\n        headers={\"Idempotency-Key\": \"bad-body\"},\n    )\n    assert resp.status_code == 422\n\ndef test_missing_idempotency_key():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n    )\n    assert resp.status_code == 422\n\ndef test_invalid_idempotency_key_format():\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"\"},\n    )\n    assert resp.status_code == 422\n\ndef test_unknown_payment():\n    resp = client.post(\n        \"/payments/unknown/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"unknown-pay\"},\n    )\n    assert resp.status_code == 404\n\ndef test_refund_cancelled_payment():\n    resp = client.post(\n        \"/payments/p3/refunds\",\n        json={\"amount\": 100},\n        headers={\"Idempotency-Key\": \"cancelled\"},\n    )\n    assert resp.status_code == 409\n\ndef test_over_refund():\n    # p2 amount is 500, already refunded 200 in earlier test\n    resp = client.post(\n        \"/payments/p2/refunds\",\n        json={\"amount\": 400},\n        headers={\"Idempotency-Key\": \"over-refund\"},\n    )\n    assert resp.status_code == 409\n\ndef test_full_refund_and_subsequent_idempotent_replay():\n    # p1 has 1000 total, 300 already refunded\n    resp = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 700},\n        headers={\"Idempotency-Key\": \"full-refund\"},\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data[\"status\"] == \"refunded\"\n    assert data[\"refunded_total\"] == 1000\n    replay = client.post(\n        \"/payments/p1/refunds\",\n        json={\"amount\": 700},\n        headers={\"Idempotency-Key\": \"full-refund\"},\n    )\n    assert replay.status_code == 200\n    assert replay.json() == data\n"
+          }
+        ],
+        "summary": "Fixed IdempotencyConflict import, adjusted replay status to 200, added strict request model validation, and made refund processing atomic to satisfy idempotency and concurrency requirements."
+      }
+    }
+  ],
+  "rubric": null,
+  "model_usage": [
+    {
+      "agent": "analyst",
+      "attempt": 1,
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 1680,
+      "output_tokens": 461,
+      "thinking_tokens": 26,
+      "total_tokens": 2141,
+      "latency_ms": 2359,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "995",
+        "x-ratelimit-remaining-tokens": "4058",
+        "x-ratelimit-reset-requests": "7m12s",
+        "x-ratelimit-reset-tokens": "29.565s"
+      }
+    },
+    {
+      "agent": "architect",
+      "attempt": 1,
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 2066,
+      "output_tokens": 345,
+      "thinking_tokens": 38,
+      "total_tokens": 2411,
+      "latency_ms": 1860,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "994",
+        "x-ratelimit-remaining-tokens": "3681",
+        "x-ratelimit-reset-requests": "8m38.4s",
+        "x-ratelimit-reset-tokens": "32.392s"
+      }
+    },
+    {
+      "agent": "developer",
+      "attempt": 1,
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 2028,
+      "output_tokens": 2798,
+      "thinking_tokens": 37,
+      "total_tokens": 4826,
+      "latency_ms": 6765,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "993",
+        "x-ratelimit-remaining-tokens": "551",
+        "x-ratelimit-reset-requests": "10m4.8s",
+        "x-ratelimit-reset-tokens": "55.867s"
+      }
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 1,
+      "status": "failed",
+      "latency_ms": 672,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    {
+      "agent": "developer",
+      "attempt": 1,
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "input_tokens": 5845,
+      "output_tokens": 2975,
+      "thinking_tokens": 428,
+      "total_tokens": 8820,
+      "latency_ms": 8484,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "cost_basis": "configured token rates; not a provider invoice",
+      "tokens_status": "reported",
+      "finish_reason": "stop",
+      "rate_limits": {
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-limit-tokens": "8000",
+        "x-ratelimit-remaining-requests": "999",
+        "x-ratelimit-remaining-tokens": "1819",
+        "x-ratelimit-reset-requests": "1m26.4s",
+        "x-ratelimit-reset-tokens": "46.357s"
+      }
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 1,
+      "status": "failed",
+      "latency_ms": 891,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 1,
+      "status": "failed",
+      "latency_ms": 9063,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 2,
+      "status": "failed",
+      "latency_ms": 937,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 1,
+      "status": "failed",
+      "latency_ms": 8312,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    },
+    {
+      "agent": "developer",
+      "provider": "groq",
+      "model": "openai/gpt-oss-120b",
+      "attempt": 2,
+      "status": "failed",
+      "latency_ms": 1469,
+      "cost_usd": null,
+      "cost_status": "unknown",
+      "input_tokens": null,
+      "output_tokens": null
+    }
+  ],
+  "independent_acceptance": {
+    "operation": "acceptance",
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider",
+      "_cortexforge_acceptance.py"
+    ],
+    "exit_code": 1,
+    "output": ".......FF.........                                                       [100%]\n=================================== FAILURES ===================================\n___________________________ test_invalid_amount[10] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7cbeb58af380>\namount = '10'\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       AssertionError: assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x7cbeb58af380>, '10')\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_amount[True] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7cbeb598d9d0>\namount = True\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x7cbeb598d9d0>, True)\n\n_cortexforge_acceptance.py:44: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\napi.py:14\n  /workspace/api.py:14: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    @validator(\"amount\")\n\napi.py:11\n  /workspace/api.py:11: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    class RefundRequest(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED _cortexforge_acceptance.py::test_invalid_amount[10] - AssertionError: ...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[True] - assert 201 == 422\n2 failed, 16 passed, 3 warnings in 1.05s\n",
+    "truncated": false,
+    "duration_ms": 2468,
+    "timeout": false,
+    "executor": "docker",
+    "image": "cortexforge-sandbox:local",
+    "test_counts": {
+      "passed": 16,
+      "failed": 2,
+      "error": 0,
+      "skipped": 0
+    },
+    "tree_hash": "e6a86a37375663d5c42331da71516770c7d63b2eb4970f56dedac3c0304f6e4d",
+    "phase": "candidate",
+    "iteration": 1
+  },
+  "checks": [
+    {
+      "operation": "unit",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 1,
+      "output": "....FFF......F                                                           [100%]\n=================================== FAILURES ===================================\n_______________________ test_idempotent_replay_same_key ________________________\n\n    def test_idempotent_replay_same_key():\n        # first request\n        resp1 = client.post(\n            \"/payments/p2/refunds\",\n            json={\"amount\": 200},\n            headers={\"Idempotency-Key\": \"replay-key\"},\n        )\n        assert resp1.status_code == 201\n        # replay\n        resp2 = client.post(\n            \"/payments/p2/refunds\",\n            json={\"amount\": 200},\n            headers={\"Idempotency-Key\": \"replay-key\"},\n        )\n>       assert resp2.status_code == 200\nE       assert 201 == 200\nE        +  where 201 = <Response [201 Created]>.status_code\n\ntests/test_refunds.py:36: AssertionError\n__________________ test_idempotency_conflict_different_amount __________________\n\npayment_id = 'p1'\nrequest = <starlette.requests.Request object at 0x7bb3078c1430>\nrefund = RefundRequest(amount=150), idempotency_key = 'conflict-key'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n>           result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n\napi.py:45: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nself = <service.PaymentService object at 0x7bb3079970e0>, payment_id = 'p1'\namount = 150, idempotency_key = 'conflict-key'\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Idempotency handling \u2013 ensure atomic check\u2011and\u2011set\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                # Verify that stored key matches same payment and amount\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    return stored_status, stored_payload\n                else:\n>                   raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\nE                   service.IdempotencyConflict: Idempotency key conflict with different payment or amount\n\nservice.py:54: IdempotencyConflict\n\nDuring handling of the above exception, another exception occurred:\n\n    def test_idempotency_conflict_different_amount():\n        # initial use\n        client.post(\n            \"/payments/p1/refunds\",\n            json={\"amount\": 100},\n            headers={\"Idempotency-Key\": \"conflict-key\"},\n        )\n        # conflict with different amount\n>       resp = client.post(\n            \"/payments/p1/refunds\",\n            json={\"amount\": 150},\n            headers={\"Idempotency-Key\": \"conflict-key\"},\n        )\n\ntests/test_refunds.py:47: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:538: in post\n    return super().post(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1144: in post\n    return self.request(\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:437: in request\n    return super().request(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:825: in request\n    return self.send(request, auth=auth, follow_redirects=follow_redirects)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:914: in send\n    response = self._send_handling_auth(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth\n    response = self._send_handling_redirects(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects\n    response = self._send_single_request(request)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request\n    response = transport.handle_request(request)\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:340: in handle_request\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:337: in handle_request\n    portal.call(self.app, scope, receive, send)\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:347: in call\n    return cast(T_Retval, self.start_task_soon(func, *args).result())\n/usr/local/lib/python3.12/concurrent/futures/_base.py:449: in result\n    return self.__get_result()\n/usr/local/lib/python3.12/concurrent/futures/_base.py:401: in __get_result\n    raise self._exception\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:272: in _call_func\n    retval = await retval_or_awaitable\n/usr/local/lib/python3.12/site-packages/fastapi/applications.py:1054: in __call__\n    await super().__call__(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/applications.py:112: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:187: in __call__\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:165: in __call__\n    await self.app(scope, receive, _send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/exceptions.py:62: in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:714: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:734: in app\n    await route.handle(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:288: in handle\n    await self.app(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:76: in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:73: in app\n    response = await f(request)\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:301: in app\n    raw_response = await run_endpoint_function(\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:212: in run_endpoint_function\n    return await dependant.call(**values)\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\npayment_id = 'p1'\nrequest = <starlette.requests.Request object at 0x7bb3078c1430>\nrefund = RefundRequest(amount=150), idempotency_key = 'conflict-key'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n>       except service.IdempotencyConflict as ic:\nE       AttributeError: 'PaymentService' object has no attribute 'IdempotencyConflict'\n\napi.py:55: AttributeError\n_________________ test_idempotency_conflict_different_payment __________________\n\npayment_id = 'p2'\nrequest = <starlette.requests.Request object at 0x7bb3078c0590>\nrefund = RefundRequest(amount=50), idempotency_key = 'diff-pay-key'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n>           result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n\napi.py:45: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nself = <service.PaymentService object at 0x7bb3079970e0>, payment_id = 'p2'\namount = 50, idempotency_key = 'diff-pay-key'\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Idempotency handling \u2013 ensure atomic check\u2011and\u2011set\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                # Verify that stored key matches same payment and amount\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    return stored_status, stored_payload\n                else:\n>                   raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\nE                   service.IdempotencyConflict: Idempotency key conflict with different payment or amount\n\nservice.py:54: IdempotencyConflict\n\nDuring handling of the above exception, another exception occurred:\n\n    def test_idempotency_conflict_different_payment():\n        client.post(\n            \"/payments/p1/refunds\",\n            json={\"amount\": 50},\n            headers={\"Idempotency-Key\": \"diff-pay-key\"},\n        )\n>       resp = client.post(\n            \"/payments/p2/refunds\",\n            json={\"amount\": 50},\n            headers={\"Idempotency-Key\": \"diff-pay-key\"},\n        )\n\ntests/test_refunds.py:60: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:538: in post\n    return super().post(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1144: in post\n    return self.request(\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:437: in request\n    return super().request(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:825: in request\n    return self.send(request, auth=auth, follow_redirects=follow_redirects)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:914: in send\n    response = self._send_handling_auth(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth\n    response = self._send_handling_redirects(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects\n    response = self._send_single_request(request)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request\n    response = transport.handle_request(request)\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:340: in handle_request\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:337: in handle_request\n    portal.call(self.app, scope, receive, send)\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:347: in call\n    return cast(T_Retval, self.start_task_soon(func, *args).result())\n/usr/local/lib/python3.12/concurrent/futures/_base.py:456: in result\n    return self.__get_result()\n/usr/local/lib/python3.12/concurrent/futures/_base.py:401: in __get_result\n    raise self._exception\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:272: in _call_func\n    retval = await retval_or_awaitable\n/usr/local/lib/python3.12/site-packages/fastapi/applications.py:1054: in __call__\n    await super().__call__(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/applications.py:112: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:187: in __call__\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:165: in __call__\n    await self.app(scope, receive, _send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/exceptions.py:62: in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:714: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:734: in app\n    await route.handle(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:288: in handle\n    await self.app(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:76: in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:73: in app\n    response = await f(request)\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:301: in app\n    raw_response = await run_endpoint_function(\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:212: in run_endpoint_function\n    return await dependant.call(**values)\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\npayment_id = 'p2'\nrequest = <starlette.requests.Request object at 0x7bb3078c0590>\nrefund = RefundRequest(amount=50), idempotency_key = 'diff-pay-key'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n>       except service.IdempotencyConflict as ic:\nE       AttributeError: 'PaymentService' object has no attribute 'IdempotencyConflict'\n\napi.py:55: AttributeError\n______________ test_full_refund_and_subsequent_idempotent_replay _______________\n\n    def test_full_refund_and_subsequent_idempotent_replay():\n        # fresh payment p1 has 1000 total, 300 already refunded from test_successful_refund\n        resp = client.post(\n            \"/payments/p1/refunds\",\n            json={\"amount\": 700},\n            headers={\"Idempotency-Key\": \"full-refund\"},\n        )\n>       assert resp.status_code == 201\nE       assert 409 == 201\nE        +  where 409 = <Response [409 Conflict]>.status_code\n\ntests/test_refunds.py:122: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\napi.py:14\n  /workspace/api.py:14: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    @validator(\"amount\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_refunds.py::test_idempotent_replay_same_key - assert 201 ==...\nFAILED tests/test_refunds.py::test_idempotency_conflict_different_amount - At...\nFAILED tests/test_refunds.py::test_idempotency_conflict_different_payment - A...\nFAILED tests/test_refunds.py::test_full_refund_and_subsequent_idempotent_replay\n4 failed, 10 passed, 2 warnings in 1.65s\n",
+      "truncated": false,
+      "duration_ms": 2906,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 10,
+        "failed": 4,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "98efb18bb9984a68d5217a1e66a2d8524c82e21adfe2f785014ba51c3f5f0a34",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "lint",
+      "command": [
+        "ruff",
+        "check",
+        "--no-cache",
+        "."
+      ],
+      "exit_code": 1,
+      "output": "tests/test_refunds.py:1:8: F401 [*] `pytest` imported but unused\n  |\n1 | import pytest\n  |        ^^^^^^ F401\n2 | from fastapi.testclient import TestClient\n3 | from api import create_app\n  |\n  = help: Remove unused import: `pytest`\n\nFound 1 error.\n[*] 1 fixable with the `--fix` option.\n",
+      "truncated": false,
+      "duration_ms": 782,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "tree_hash": "98efb18bb9984a68d5217a1e66a2d8524c82e21adfe2f785014ba51c3f5f0a34",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "acceptance",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "_cortexforge_acceptance.py"
+      ],
+      "exit_code": 1,
+      "output": ".FFF...FF.......FF                                                       [100%]\n=================================== FAILURES ===================================\n_______ test_replay_preserves_original_response_even_after_final_refund ________\n\nclient = <starlette.testclient.TestClient object at 0x74e83b855df0>\n\n    def test_replay_preserves_original_response_even_after_final_refund(client):\n        first = refund(client)\n        assert first.status_code == 201\n        assert refund(client, 700, \"final\").status_code == 201\n        replay = refund(client)\n>       assert replay.status_code == 200 and replay.json() == first.json()\nE       assert (201 == 200)\nE        +  where 201 = <Response [201 Created]>.status_code\n\n_cortexforge_acceptance.py:32: AssertionError\n_______________________ test_conflicting_replay[301-p1] ________________________\n\npayment_id = 'p1'\nrequest = <starlette.requests.Request object at 0x74e838de05c0>\nrefund = RefundRequest(amount=301), idempotency_key = 'request-1'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n>           result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n\napi.py:45: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nself = <service.PaymentService object at 0x74e839f6fc80>, payment_id = 'p1'\namount = 301, idempotency_key = 'request-1'\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Idempotency handling \u2013 ensure atomic check\u2011and\u2011set\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                # Verify that stored key matches same payment and amount\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    return stored_status, stored_payload\n                else:\n>                   raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\nE                   service.IdempotencyConflict: Idempotency key conflict with different payment or amount\n\nservice.py:54: IdempotencyConflict\n\nDuring handling of the above exception, another exception occurred:\n\nclient = <starlette.testclient.TestClient object at 0x74e839f6ff80>\namount = 301, payment = 'p1'\n\n    @pytest.mark.parametrize(\"amount,payment\", [(301, \"p1\"), (300, \"p2\")])\n    def test_conflicting_replay(client, amount, payment):\n        assert refund(client).status_code == 201\n>       assert refund(client, amount, payment=payment).status_code == 409\n\n_cortexforge_acceptance.py:38: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n_cortexforge_acceptance.py:12: in refund\n    return client.post(f\"/payments/{payment}/refunds\", json={\"amount\": amount},\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:538: in post\n    return super().post(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1144: in post\n    return self.request(\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:437: in request\n    return super().request(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:825: in request\n    return self.send(request, auth=auth, follow_redirects=follow_redirects)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:914: in send\n    response = self._send_handling_auth(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth\n    response = self._send_handling_redirects(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects\n    response = self._send_single_request(request)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request\n    response = transport.handle_request(request)\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:340: in handle_request\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:337: in handle_request\n    portal.call(self.app, scope, receive, send)\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:347: in call\n    return cast(T_Retval, self.start_task_soon(func, *args).result())\n/usr/local/lib/python3.12/concurrent/futures/_base.py:449: in result\n    return self.__get_result()\n/usr/local/lib/python3.12/concurrent/futures/_base.py:401: in __get_result\n    raise self._exception\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:272: in _call_func\n    retval = await retval_or_awaitable\n/usr/local/lib/python3.12/site-packages/fastapi/applications.py:1054: in __call__\n    await super().__call__(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/applications.py:112: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:187: in __call__\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:165: in __call__\n    await self.app(scope, receive, _send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/exceptions.py:62: in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:714: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:734: in app\n    await route.handle(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:288: in handle\n    await self.app(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:76: in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:73: in app\n    response = await f(request)\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:301: in app\n    raw_response = await run_endpoint_function(\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:212: in run_endpoint_function\n    return await dependant.call(**values)\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\npayment_id = 'p1'\nrequest = <starlette.requests.Request object at 0x74e838de05c0>\nrefund = RefundRequest(amount=301), idempotency_key = 'request-1'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n>       except service.IdempotencyConflict as ic:\nE       AttributeError: 'PaymentService' object has no attribute 'IdempotencyConflict'\n\napi.py:55: AttributeError\n_______________________ test_conflicting_replay[300-p2] ________________________\n\npayment_id = 'p2'\nrequest = <starlette.requests.Request object at 0x74e838de38f0>\nrefund = RefundRequest(amount=300), idempotency_key = 'request-1'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n>           result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n\napi.py:45: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nself = <service.PaymentService object at 0x74e839faac60>, payment_id = 'p2'\namount = 300, idempotency_key = 'request-1'\n\n    def process_refund(\n        self, payment_id: str, amount: int, idempotency_key: str\n    ) -> Tuple[int, dict]:\n        # Idempotency handling \u2013 ensure atomic check\u2011and\u2011set\n        with self.idempotency_lock:\n            if idempotency_key in self.idempotency_store:\n                stored_status, stored_payload = self.idempotency_store[idempotency_key]\n                # Verify that stored key matches same payment and amount\n                if (\n                    stored_payload.get(\"payment_id\") == payment_id\n                    and stored_payload.get(\"amount\") == amount\n                ):\n                    return stored_status, stored_payload\n                else:\n>                   raise IdempotencyConflict(\n                        \"Idempotency key conflict with different payment or amount\"\n                    )\nE                   service.IdempotencyConflict: Idempotency key conflict with different payment or amount\n\nservice.py:54: IdempotencyConflict\n\nDuring handling of the above exception, another exception occurred:\n\nclient = <starlette.testclient.TestClient object at 0x74e839faaab0>\namount = 300, payment = 'p2'\n\n    @pytest.mark.parametrize(\"amount,payment\", [(301, \"p1\"), (300, \"p2\")])\n    def test_conflicting_replay(client, amount, payment):\n        assert refund(client).status_code == 201\n>       assert refund(client, amount, payment=payment).status_code == 409\n\n_cortexforge_acceptance.py:38: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n_cortexforge_acceptance.py:12: in refund\n    return client.post(f\"/payments/{payment}/refunds\", json={\"amount\": amount},\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:538: in post\n    return super().post(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1144: in post\n    return self.request(\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:437: in request\n    return super().request(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:825: in request\n    return self.send(request, auth=auth, follow_redirects=follow_redirects)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:914: in send\n    response = self._send_handling_auth(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth\n    response = self._send_handling_redirects(\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects\n    response = self._send_single_request(request)\n/usr/local/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request\n    response = transport.handle_request(request)\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:340: in handle_request\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/testclient.py:337: in handle_request\n    portal.call(self.app, scope, receive, send)\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:347: in call\n    return cast(T_Retval, self.start_task_soon(func, *args).result())\n/usr/local/lib/python3.12/concurrent/futures/_base.py:449: in result\n    return self.__get_result()\n/usr/local/lib/python3.12/concurrent/futures/_base.py:401: in __get_result\n    raise self._exception\n/usr/local/lib/python3.12/site-packages/anyio/from_thread.py:272: in _call_func\n    retval = await retval_or_awaitable\n/usr/local/lib/python3.12/site-packages/fastapi/applications.py:1054: in __call__\n    await super().__call__(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/applications.py:112: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:187: in __call__\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/middleware/errors.py:165: in __call__\n    await self.app(scope, receive, _send)\n/usr/local/lib/python3.12/site-packages/starlette/middleware/exceptions.py:62: in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:714: in __call__\n    await self.middleware_stack(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:734: in app\n    await route.handle(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:288: in handle\n    await self.app(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:76: in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app\n    raise exc\n/usr/local/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app\n    await app(scope, receive, sender)\n/usr/local/lib/python3.12/site-packages/starlette/routing.py:73: in app\n    response = await f(request)\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:301: in app\n    raw_response = await run_endpoint_function(\n/usr/local/lib/python3.12/site-packages/fastapi/routing.py:212: in run_endpoint_function\n    return await dependant.call(**values)\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\npayment_id = 'p2'\nrequest = <starlette.requests.Request object at 0x74e838de38f0>\nrefund = RefundRequest(amount=300), idempotency_key = 'request-1'\n\n    @app.post(\"/payments/{payment_id}/refunds\")\n    async def create_refund(\n        payment_id: str,\n        request: Request,\n        refund: RefundRequest,\n        idempotency_key: str = Header(..., alias=\"Idempotency-Key\"),\n    ):\n        # Header validation per spec: 1-64 chars, ASCII letters, digits, hyphen, underscore\n        if not (1 <= len(idempotency_key) <= 64) or not all(\n            c.isalnum() or c in \"-_\" for c in idempotency_key\n        ):\n            raise HTTPException(422, \"Invalid Idempotency-Key header\")\n        try:\n            result = service.process_refund(\n                payment_id=payment_id,\n                amount=refund.amount,\n                idempotency_key=idempotency_key,\n            )\n        except KeyError:\n            raise HTTPException(404, \"Payment not found\") from None\n        except ValueError as ve:\n            # Business rule violation (e.g., over\u2011refund, cancelled)\n            raise HTTPException(409, str(ve)) from None\n>       except service.IdempotencyConflict as ic:\nE       AttributeError: 'PaymentService' object has no attribute 'IdempotencyConflict'\n\napi.py:55: AttributeError\n___________________________ test_invalid_amount[10] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x74e8389c2e40>\namount = '10'\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       AssertionError: assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x74e8389c2e40>, '10')\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_amount[True] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x74e8389c1370>\namount = True\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x74e8389c1370>, True)\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_extra_fields_rejected __________________________\n\nclient = <starlette.testclient.TestClient object at 0x74e83898d6d0>\n\n    def test_extra_fields_rejected(client):\n        result = client.post(\"/payments/p1/refunds\", json={\"amount\": 1, \"admin\": True},\n                             headers={\"Idempotency-Key\": \"extra\"})\n>       assert result.status_code == 422\nE       assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\n\n_cortexforge_acceptance.py:66: AssertionError\n__________________ test_concurrent_duplicate_is_applied_once ___________________\n\nclient = <starlette.testclient.TestClient object at 0x74e83898d880>\n\n    def test_concurrent_duplicate_is_applied_once(client):\n        with ThreadPoolExecutor(max_workers=4) as pool:\n            responses = list(pool.map(lambda _: refund(client), range(4)))\n>       assert sorted(r.status_code for r in responses) == [200, 200, 200, 201]\nE       assert [201, 201, 201, 201] == [200, 200, 200, 201]\nE         \nE         At index 0 diff: 201 != 200\nE         Use -v to get more diff\n\n_cortexforge_acceptance.py:71: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\napi.py:14\n  /workspace/api.py:14: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    @validator(\"amount\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED _cortexforge_acceptance.py::test_replay_preserves_original_response_even_after_final_refund\nFAILED _cortexforge_acceptance.py::test_conflicting_replay[301-p1] - Attribut...\nFAILED _cortexforge_acceptance.py::test_conflicting_replay[300-p2] - Attribut...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[10] - AssertionError: ...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[True] - assert 201 == 422\nFAILED _cortexforge_acceptance.py::test_extra_fields_rejected - assert 201 ==...\nFAILED _cortexforge_acceptance.py::test_concurrent_duplicate_is_applied_once\n7 failed, 11 passed, 2 warnings in 1.84s\n",
+      "truncated": false,
+      "duration_ms": 3172,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 11,
+        "failed": 7,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "98efb18bb9984a68d5217a1e66a2d8524c82e21adfe2f785014ba51c3f5f0a34",
+      "phase": "candidate",
+      "iteration": 0
+    },
+    {
+      "operation": "unit",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 1,
+      "output": ".............F                                                           [100%]\n=================================== FAILURES ===================================\n______________ test_full_refund_and_subsequent_idempotent_replay _______________\n\n    def test_full_refund_and_subsequent_idempotent_replay():\n        # p1 has 1000 total, 300 already refunded\n        resp = client.post(\n            \"/payments/p1/refunds\",\n            json={\"amount\": 700},\n            headers={\"Idempotency-Key\": \"full-refund\"},\n        )\n>       assert resp.status_code == 201\nE       assert 409 == 201\nE        +  where 409 = <Response [409 Conflict]>.status_code\n\ntests/test_refunds.py:120: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\napi.py:14\n  /workspace/api.py:14: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    @validator(\"amount\")\n\napi.py:11\n  /workspace/api.py:11: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    class RefundRequest(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_refunds.py::test_full_refund_and_subsequent_idempotent_replay\n1 failed, 13 passed, 3 warnings in 1.17s\n",
+      "truncated": false,
+      "duration_ms": 3297,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 13,
+        "failed": 1,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "e6a86a37375663d5c42331da71516770c7d63b2eb4970f56dedac3c0304f6e4d",
+      "phase": "candidate",
+      "iteration": 1
+    },
+    {
+      "operation": "lint",
+      "command": [
+        "ruff",
+        "check",
+        "--no-cache",
+        "."
+      ],
+      "exit_code": 1,
+      "output": "tests/test_refunds.py:1:8: F401 [*] `pytest` imported but unused\n  |\n1 | import pytest\n  |        ^^^^^^ F401\n2 | from fastapi.testclient import TestClient\n3 | from api import create_app\n  |\n  = help: Remove unused import: `pytest`\n\nFound 1 error.\n[*] 1 fixable with the `--fix` option.\n",
+      "truncated": false,
+      "duration_ms": 906,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "tree_hash": "e6a86a37375663d5c42331da71516770c7d63b2eb4970f56dedac3c0304f6e4d",
+      "phase": "candidate",
+      "iteration": 1
+    },
+    {
+      "operation": "acceptance",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "_cortexforge_acceptance.py"
+      ],
+      "exit_code": 1,
+      "output": ".......FF.........                                                       [100%]\n=================================== FAILURES ===================================\n___________________________ test_invalid_amount[10] ____________________________\n\nclient = <starlette.testclient.TestClient object at 0x7cbeb58af380>\namount = '10'\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       AssertionError: assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x7cbeb58af380>, '10')\n\n_cortexforge_acceptance.py:44: AssertionError\n__________________________ test_invalid_amount[True] ___________________________\n\nclient = <starlette.testclient.TestClient object at 0x7cbeb598d9d0>\namount = True\n\n    @pytest.mark.parametrize(\"amount\", [0, -1, 1.5, \"10\", True, None])\n    def test_invalid_amount(client, amount):\n>       assert refund(client, amount).status_code == 422\nE       assert 201 == 422\nE        +  where 201 = <Response [201 Created]>.status_code\nE        +    where <Response [201 Created]> = refund(<starlette.testclient.TestClient object at 0x7cbeb598d9d0>, True)\n\n_cortexforge_acceptance.py:44: AssertionError\n=============================== warnings summary ===============================\n../usr/local/lib/python3.12/site-packages/starlette/testclient.py:37\n  /usr/local/lib/python3.12/site-packages/starlette/testclient.py:37: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.\n    _PortalFactoryType = typing.Callable[[], typing.ContextManager[anyio.abc.BlockingPortal]]\n\napi.py:14\n  /workspace/api.py:14: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    @validator(\"amount\")\n\napi.py:11\n  /workspace/api.py:11: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/\n    class RefundRequest(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED _cortexforge_acceptance.py::test_invalid_amount[10] - AssertionError: ...\nFAILED _cortexforge_acceptance.py::test_invalid_amount[True] - assert 201 == 422\n2 failed, 16 passed, 3 warnings in 1.05s\n",
+      "truncated": false,
+      "duration_ms": 2468,
+      "timeout": false,
+      "executor": "docker",
+      "image": "cortexforge-sandbox:local",
+      "test_counts": {
+        "passed": 16,
+        "failed": 2,
+        "error": 0,
+        "skipped": 0
+      },
+      "tree_hash": "e6a86a37375663d5c42331da71516770c7d63b2eb4970f56dedac3c0304f6e4d",
+      "phase": "candidate",
+      "iteration": 1
+    }
+  ],
+  "human_decision": "Not supplied; evaluation never approves itself"
+}

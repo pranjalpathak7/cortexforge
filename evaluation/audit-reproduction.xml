@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="3" skipped="1" tests="8" time="14.673" timestamp="2026-11-21T05:02:14.937285+05:30" hostname="redacted-host"><testcase classname="backend.tests.test_audit" name="test_test_infrastructure_aliases_rejected[./tests/test_payments.py]" time="1.638" /><testcase classname="backend.tests.test_audit" name="test_test_infrastructure_aliases_rejected[tests//test_payments.py]" time="1.425" /><testcase classname="backend.tests.test_audit" name="test_test_infrastructure_aliases_rejected[.GIT/config]" time="1.336" /><testcase classname="backend.tests.test_audit" name="test_test_infrastructure_aliases_rejected[folder./x.py]" time="1.263" /><testcase classname="backend.tests.test_audit" name="test_test_infrastructure_aliases_rejected[tests/test_x/conftest.py]" time="1.476"><failure message="Failed: DID NOT RAISE PolicyViolation">engine = &lt;cortexforge.workflow.Engine object at 0x000001E3FEB01D90&gt;
+sample = WindowsPath('&lt;temporary-directory&gt;/pytest-of-HP/pytest-8/test_test_infrastructure_alias4/sample')
+name = 'tests/test_x/conftest.py'
+
+    @pytest.mark.parametrize("name", ["./tests/test_payments.py", "tests//test_payments.py",
+                                       ".GIT/config", "folder./x.py", "tests/test_x/conftest.py"])
+    def test_test_infrastructure_aliases_rejected(engine, sample, name):
+        run = create(engine, sample)
+&gt;       with pytest.raises(PolicyViolation):
+E       Failed: DID NOT RAISE PolicyViolation
+
+backend\tests\test_audit.py:17: Failed</failure></testcase><testcase classname="backend.tests.test_audit" name="test_root_conftest_is_immutable" time="1.782"><failure message="Failed: DID NOT RAISE PolicyViolation">engine = &lt;cortexforge.workflow.Engine object at 0x000001E3FEB266F0&gt;
+sample = WindowsPath('&lt;temporary-directory&gt;/pytest-of-HP/pytest-8/test_root_conftest_is_immutabl0/sample')
+
+    def test_root_conftest_is_immutable(engine, sample):
+        (sample / "conftest.py").write_text("# baseline configuration\n")
+        git(sample, "add", ".")
+        git(sample, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-m", "test configuration")
+        run = create(engine, sample)
+&gt;       with pytest.raises(PolicyViolation):
+E       Failed: DID NOT RAISE PolicyViolation
+
+backend\tests\test_audit.py:27: Failed</failure></testcase><testcase classname="backend.tests.test_audit" name="test_noop_cannot_reach_review" time="2.994"><failure message="AssertionError: assert 'AWAITING_HUMAN_APPROVAL' == 'FAILED'&#10;  &#10;  - FAILED&#10;  + AWAITING_HUMAN_APPROVAL">engine = &lt;cortexforge.workflow.Engine object at 0x000001E3FEB01A60&gt;
+sample = WindowsPath('&lt;temporary-directory&gt;/pytest-of-HP/pytest-8/test_noop_cannot_reach_review0/sample')
+
+    def test_noop_cannot_reach_review(engine, sample):
+        class Noop(DemoProvider):
+            def generate(self, agent, context, schema):
+                response = super().generate(agent, context, schema)
+                if agent == "developer":
+                    value = json.loads(response.text)
+                    value["changes"] = [{"path": "payments.py", "content": BASE}]
+                    return Response(json.dumps(value), response.usage)
+                return response
+    
+        engine.provider = Noop()
+        run = engine.create(CreateRun(repository=str(sample), requirement="Preserve the original totals API"))
+        result = engine.run(run["id"])
+&gt;       assert result["state"] == "FAILED"
+E       AssertionError: assert 'AWAITING_HUMAN_APPROVAL' == 'FAILED'
+E         
+E         - FAILED
+E         + AWAITING_HUMAN_APPROVAL
+
+backend\tests\test_audit.py:45: AssertionError</failure></testcase><testcase classname="backend.tests.test_audit" name="test_link_escape_rejected" time="0.006"><skipped type="pytest.skip" message="Creating symlinks requires OS privileges">&lt;workspace&gt;\backend\tests\test_audit.py:57: Creating symlinks requires OS privileges</skipped></testcase></testsuite></testsuites>

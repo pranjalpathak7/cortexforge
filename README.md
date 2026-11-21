@@ -95,8 +95,7 @@ and evidence. It does not merge or deploy. Local Docker is a development securit
 boundary, not a guarantee against sophisticated hostile workloads. Tests and
 static scans cannot prove arbitrary acceptance criteria or complete security.
 
-The repository is prepared for local review. No repository has been published,
-no remote push performed, and no external application deployed.
+*CortexForge is publicly available on GitHub as a locally executable case-study implementation*
 
 ## Demonstrations and audit
 
